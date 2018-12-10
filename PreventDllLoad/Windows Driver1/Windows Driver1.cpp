@@ -15,19 +15,11 @@ typedef NTSTATUS(*NTPROTECTVIRTUALMEMORY)(IN HANDLE ProcessHandle,
 	IN ULONG NewAccessProtection,
 	OUT PULONG UnsafeOldAccessProtection);
 
-typedef struct _USER_PROTECT_MEMORY
-{
-	PVOID	  ProtectBase;
-	ULONG_PTR ProtectSize;
-	ULONG	  OldProtectAccess;
-}USER_PROTECT_MEMORY, *PUSER_PROTECT_MEMORY;
-
 BOOLEAN Local_ProtectVirtualMemory(IN PVOID UnsafeBaseAddress,IN SIZE_T UnsafeNumberOfBytesToProtect, IN ULONG NewAccessProtection)
 {
 	NTSTATUS Status = STATUS_UNSUCCESSFUL;
 
-	ULONG_PTR RegionSize = 0;
-	PUSER_PROTECT_MEMORY UserProtectMemroy = NULL;
+	ULONG OldProtectAccess = 0;
 	
 	SSDT Ssdt;
 	NTPROTECTVIRTUALMEMORY NtProtectVirtualMemory = NULL;
@@ -41,21 +33,7 @@ BOOLEAN Local_ProtectVirtualMemory(IN PVOID UnsafeBaseAddress,IN SIZE_T UnsafeNu
 		return FALSE;
 	}
 
-	RegionSize = sizeof(USER_PROTECT_MEMORY);
-	/*因为在内核调用Nt系列的函数会检查参数的地址是否是应用层的（如果Previous不是UserMode），
-	所以这里分配一片应用层的内存来保存参数*/
-	Status = ZwAllocateVirtualMemory(NtCurrentProcess(), (PVOID *)&UserProtectMemroy, 0, &RegionSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-	if (!NT_SUCCESS(Status))
-	{
-		KdPrint(("AllocateMemory Fail!\n"));
-		return FALSE;
-	}
-
-	UserProtectMemroy->ProtectBase = UnsafeBaseAddress;
-	UserProtectMemroy->ProtectSize = UnsafeNumberOfBytesToProtect;
-	UserProtectMemroy->OldProtectAccess = 0;
-
-	Status = NtProtectVirtualMemory(NtCurrentProcess(), &UserProtectMemroy->ProtectBase, &UserProtectMemroy->ProtectSize, NewAccessProtection, &UserProtectMemroy->OldProtectAccess);
+	Status = NtProtectVirtualMemory(NtCurrentProcess(), (PVOID*)UnsafeBaseAddress, &UnsafeNumberOfBytesToProtect, NewAccessProtection, &OldProtectAccess);
 	if (!NT_SUCCESS(Status))
 	{
 		KdPrint(("ProtectMemory Fail!\n"));
