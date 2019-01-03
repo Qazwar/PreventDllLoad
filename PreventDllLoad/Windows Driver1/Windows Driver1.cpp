@@ -7,6 +7,7 @@ typedef struct _MODULE_INFO
 {
 	ULONG_PTR DllEntry;
 	HANDLE ProcessID;
+	HANDLE LoadImageThreadId;
 }MODULE_INFO, *PMODULE_INFO;
 
 typedef struct _USER_PROTECT_MEMORY
@@ -22,7 +23,32 @@ typedef NTSTATUS(*NTPROTECTVIRTUALMEMORY)(IN HANDLE ProcessHandle,
 	IN ULONG NewAccessProtection,
 	OUT PULONG UnsafeOldAccessProtection);
 
-BOOLEAN Local_ProtectVirtualMemory(IN PVOID UnsafeBaseAddress,IN SIZE_T UnsafeNumberOfBytesToProtect, IN ULONG NewAccessProtection)
+typedef NTSTATUS(*NTOPENTHREAD)(
+	OUT PHANDLE ThreadHandle,
+	IN ACCESS_MASK DesiredAccess,
+	IN POBJECT_ATTRIBUTES ObjectAttributes,
+	IN PCLIENT_ID ClientId OPTIONAL
+	);
+
+typedef NTSTATUS(*NTSUSPENDTHREAD)(
+	IN HANDLE ThreadHandle,
+	OUT PULONG PreviousSuspendCount OPTIONAL
+	);
+
+typedef NTSTATUS(*NTRESUMETHREAD)(
+	IN HANDLE ThreadHandle,
+	OUT PULONG PreviousSuspendCount OPTIONAL
+	);
+
+PVOID GetProcAddress(WCHAR *ProcName)
+{
+	UNICODE_STRING uProcName = { 0 };
+	RtlInitUnicodeString(&uProcName, ProcName);
+
+	return MmGetSystemRoutineAddress(&uProcName);
+}
+
+BOOLEAN Local_PatchOEP(IN PVOID OEP_Address, IN PVOID PatchBuffer, IN SIZE_T PatchSize, IN HANDLE SuspendThreadId)
 {
 	NTSTATUS Status = STATUS_UNSUCCESSFUL;
 
@@ -32,8 +58,13 @@ BOOLEAN Local_ProtectVirtualMemory(IN PVOID UnsafeBaseAddress,IN SIZE_T UnsafeNu
 	SSDT Ssdt;
 	NTPROTECTVIRTUALMEMORY NtProtectVirtualMemory = NULL;
 
-	RegionSize = sizeof(USER_PROTECT_MEMORY);
-	
+	HANDLE SuspendThreadHandle = NULL;
+	OBJECT_ATTRIBUTES ObjectAttributes = { 0 };
+	CLIENT_ID ClientId = { 0 };
+
+	NTOPENTHREAD NtOpenThread = NULL;
+	NTSUSPENDTHREAD NtSuspendThread = NULL;
+	NTRESUMETHREAD NtResumeThread = NULL;
 
 	Ssdt.FindSSDT();
 	Ssdt.LoadNtdll();
@@ -44,21 +75,70 @@ BOOLEAN Local_ProtectVirtualMemory(IN PVOID UnsafeBaseAddress,IN SIZE_T UnsafeNu
 		return FALSE;
 	}
 
-	Status = ZwAllocateVirtualMemory(NtCurrentProcess(), (PVOID*)&UserProtectMemroy, 0, &RegionSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-	if (!NT_SUCCESS(Status))
+	NtOpenThread = (NTOPENTHREAD)GetProcAddress(L"NtOpenThread");
+	if (NtOpenThread == NULL)
 	{
-		KdPrint(("ZwAllocateVirtualMemory Fail!Status : %x\n",Status));
+		KdPrint(("获取NtOpenThread失败！\n"));
 		return FALSE;
 	}
 
-	UserProtectMemroy->ProtectBase = UnsafeBaseAddress;
-	UserProtectMemroy->ProtectSize = UnsafeNumberOfBytesToProtect;
+	NtSuspendThread = (NTSUSPENDTHREAD)Ssdt.GetSSDTProcByName("NtSuspendThread");
+	if (NtSuspendThread == NULL)
+	{
+		KdPrint(("获取NtSuspendThread失败！\n"));
+		return FALSE;
+	}
+
+	NtResumeThread = (NTRESUMETHREAD)Ssdt.GetSSDTProcByName("NtResumeThread");
+	if (NtResumeThread == NULL)
+	{
+		KdPrint(("获取NtResumeThread失败！\n"));
+		return FALSE;
+	}
+
+	ClientId.UniqueThread = SuspendThreadId;
+	InitializeObjectAttributes(&ObjectAttributes, 0, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, 0, 0);
+	Status = NtOpenThread(&SuspendThreadHandle, THREAD_ALL_ACCESS, &ObjectAttributes, &ClientId);
+	if (!NT_SUCCESS(Status))
+	{
+		KdPrint(("NtOpenThread Fail!Status : %x\n", Status));
+		return FALSE;
+	}
+
+	//发现NtSuspendThread去暂停结果发现一个奇怪的现象，在出LoadImage回调之前，线程不会被暂停
+	//不过在执行OEP之前线程会被暂停，所以这段时间可以放心的修改OEP
+	Status = NtSuspendThread(SuspendThreadHandle, NULL);
+	if (!NT_SUCCESS(Status))
+	{
+		KdPrint(("NtSuspendThread Fail!Status : %x\n", Status));
+		return FALSE;
+	}
+
+	RegionSize = sizeof(USER_PROTECT_MEMORY);
+	Status = ZwAllocateVirtualMemory(NtCurrentProcess(), (PVOID*)&UserProtectMemroy, 0, &RegionSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	if (!NT_SUCCESS(Status))
+	{
+		KdPrint(("ZwAllocateVirtualMemory Fail!Status : %x\n", Status));
+		return FALSE;
+	}
+
+	UserProtectMemroy->ProtectBase = OEP_Address;
+	UserProtectMemroy->ProtectSize = PatchSize;
 	UserProtectMemroy->OldProtectAccess = 0;
 
-	Status = NtProtectVirtualMemory(NtCurrentProcess(), &UserProtectMemroy->ProtectBase, &UserProtectMemroy->ProtectSize, NewAccessProtection, &UserProtectMemroy->OldProtectAccess);
+	Status = NtProtectVirtualMemory(NtCurrentProcess(), &UserProtectMemroy->ProtectBase, &UserProtectMemroy->ProtectSize, PAGE_EXECUTE_READWRITE, &UserProtectMemroy->OldProtectAccess);
 	if (!NT_SUCCESS(Status))
 	{
 		KdPrint(("NtProtectVirtualMemory Fail!Status : %x\n", Status));
+		return FALSE;
+	}
+
+	RtlCopyMemory(UserProtectMemroy->ProtectBase, PatchBuffer, PatchSize);
+
+	Status = NtResumeThread(SuspendThreadHandle, NULL);
+	if (!NT_SUCCESS(Status))
+	{
+		KdPrint(("NtResumeThread Fail!Status : %x\n", Status));
 		return FALSE;
 	}
 
@@ -84,10 +164,7 @@ VOID PatchThread(PVOID ThreadParam)
 			break;
 
 		KeStackAttachProcess(AttachedProcess, &ApcState);
-
-		if (Local_ProtectVirtualMemory((PVOID)ModuleInfo->DllEntry, sizeof(RetCode) - 1, PAGE_EXECUTE_READWRITE))
-			RtlCopyMemory((PVOID)ModuleInfo->DllEntry, RetCode, sizeof(RetCode) - 1);
-
+		Local_PatchOEP((PVOID)ModuleInfo->DllEntry, RetCode, sizeof(RetCode) - 1, ModuleInfo->LoadImageThreadId);
 		KeUnstackDetachProcess(&ApcState);
 
 	} while (FALSE);
@@ -121,8 +198,6 @@ VOID PreventDll(ULONG_PTR ImageBase,HANDLE ProcessId)
 	NTSTATUS Status = STATUS_UNSUCCESSFUL;
 	HANDLE ThreadHandle = NULL;
 
-	__debugbreak();
-
 	DosHeader = (IMAGE_DOS_HEADER *)ImageBase;
 	if (DosHeader->e_magic != IMAGE_DOS_SIGNATURE)
 		return;
@@ -139,14 +214,13 @@ VOID PreventDll(ULONG_PTR ImageBase,HANDLE ProcessId)
 
 	ModuleInfo->DllEntry = DllEntry;
 	ModuleInfo->ProcessID = ProcessId;
+	ModuleInfo->LoadImageThreadId = PsGetCurrentThreadId();
 
 	Status = PsCreateSystemThread(&ThreadHandle, THREAD_ALL_ACCESS, NULL, NULL, NULL, PatchThread, (PVOID)ModuleInfo);
 	if (NT_SUCCESS(Status))
 		ZwClose(ThreadHandle);
 
-	/*这里有个问题很烦，LoadImage回调里面无法调用ZwAllocate/Protect之类的函数，就需要开个线程去搞这个事。
-	但是有可能主线程更快，所以还没等到我patch内存，那块内存已经运行了，所以很烦，这里直睡眠一段时间等待那个线程。
-	目前没想到更好的解决方案（手动摘除进程锁有点烦）。*/
+	//为了方便，睡眠2s等待被NtSuspendThread
 	Sleep(2 * 1000);
 }
 
