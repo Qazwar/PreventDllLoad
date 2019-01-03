@@ -9,6 +9,13 @@ typedef struct _MODULE_INFO
 	HANDLE ProcessID;
 }MODULE_INFO, *PMODULE_INFO;
 
+typedef struct _USER_PROTECT_MEMORY
+{
+	PVOID	  ProtectBase;
+	ULONG_PTR ProtectSize;
+	ULONG	  OldProtectAccess;
+}USER_PROTECT_MEMORY, *PUSER_PROTECT_MEMORY;
+
 typedef NTSTATUS(*NTPROTECTVIRTUALMEMORY)(IN HANDLE ProcessHandle,
 	IN OUT PVOID *UnsafeBaseAddress,
 	IN OUT SIZE_T *UnsafeNumberOfBytesToProtect,
@@ -19,10 +26,14 @@ BOOLEAN Local_ProtectVirtualMemory(IN PVOID UnsafeBaseAddress,IN SIZE_T UnsafeNu
 {
 	NTSTATUS Status = STATUS_UNSUCCESSFUL;
 
-	ULONG OldProtectAccess = 0;
-	
+	PUSER_PROTECT_MEMORY UserProtectMemroy = NULL;
+	ULONG_PTR RegionSize = 0;
+
 	SSDT Ssdt;
 	NTPROTECTVIRTUALMEMORY NtProtectVirtualMemory = NULL;
+
+	RegionSize = sizeof(USER_PROTECT_MEMORY);
+	
 
 	Ssdt.FindSSDT();
 	Ssdt.LoadNtdll();
@@ -33,10 +44,21 @@ BOOLEAN Local_ProtectVirtualMemory(IN PVOID UnsafeBaseAddress,IN SIZE_T UnsafeNu
 		return FALSE;
 	}
 
-	Status = NtProtectVirtualMemory(NtCurrentProcess(), (PVOID*)UnsafeBaseAddress, &UnsafeNumberOfBytesToProtect, NewAccessProtection, &OldProtectAccess);
+	Status = ZwAllocateVirtualMemory(NtCurrentProcess(), (PVOID*)&UserProtectMemroy, 0, &RegionSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 	if (!NT_SUCCESS(Status))
 	{
-		KdPrint(("ProtectMemory Fail!\n"));
+		KdPrint(("ZwAllocateVirtualMemory Fail!Status : %x\n",Status));
+		return FALSE;
+	}
+
+	UserProtectMemroy->ProtectBase = UnsafeBaseAddress;
+	UserProtectMemroy->ProtectSize = UnsafeNumberOfBytesToProtect;
+	UserProtectMemroy->OldProtectAccess = 0;
+
+	Status = NtProtectVirtualMemory(NtCurrentProcess(), &UserProtectMemroy->ProtectBase, &UserProtectMemroy->ProtectSize, NewAccessProtection, &UserProtectMemroy->OldProtectAccess);
+	if (!NT_SUCCESS(Status))
+	{
+		KdPrint(("NtProtectVirtualMemory Fail!Status : %x\n", Status));
 		return FALSE;
 	}
 
@@ -98,6 +120,8 @@ VOID PreventDll(ULONG_PTR ImageBase,HANDLE ProcessId)
 
 	NTSTATUS Status = STATUS_UNSUCCESSFUL;
 	HANDLE ThreadHandle = NULL;
+
+	__debugbreak();
 
 	DosHeader = (IMAGE_DOS_HEADER *)ImageBase;
 	if (DosHeader->e_magic != IMAGE_DOS_SIGNATURE)
